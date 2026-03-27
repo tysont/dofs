@@ -2,6 +2,7 @@
 // ABOUTME: Routes HTTP requests to per-agent DOs that communicate with Containers via raw TCP.
 
 import { Container, getContainer } from '@cloudflare/containers';
+import { initSchema, SCHEMA_TABLES } from './schema';
 
 interface Env {
   DOFS: DurableObjectNamespace<DOFS>;
@@ -10,6 +11,13 @@ interface Env {
 export class DOFS extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = '30m';
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx as never, env);
+    this.ctx.blockConcurrencyWhile(async () => {
+      initSchema(this.ctx.storage.sql);
+    });
+  }
 
   override onStart() {
     console.log('Container started');
@@ -21,6 +29,17 @@ export class DOFS extends Container<Env> {
 
   override onError(error: unknown) {
     console.error('Container error:', error);
+  }
+
+  dbInfo(): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const table of SCHEMA_TABLES) {
+      const row = this.ctx.storage.sql
+        .exec<{ count: number }>(`SELECT count(*) as count FROM ${table}`)
+        .one();
+      result[table] = row.count;
+    }
+    return result;
   }
 
   async ping(): Promise<string> {
@@ -59,6 +78,11 @@ export class DOFS extends Container<Env> {
         const msg = error instanceof Error ? error.message : String(error);
         return new Response(`Error: ${msg}`, { status: 500 });
       }
+    }
+
+    if (url.pathname === '/db-info') {
+      const info = this.dbInfo();
+      return Response.json(info);
     }
 
     return new Response('Not found', { status: 404 });
