@@ -132,6 +132,64 @@ export class DOFS extends Container<Env> {
     return result;
   }
 
+  /**
+   * Test AgentFS operations from Container via Hrana bridge.
+   * DO seeds a file, Container reads it + writes its own, DO verifies.
+   */
+  async sdkTest(): Promise<unknown> {
+    // 1. DO writes seed file via AgentFS SDK
+    await this.agentFs.writeFile('/seed.txt', 'hello from DO');
+
+    // 2. Start Container with bridge + SDK test
+    this.entrypoint = ['bash', 'scripts/sdk-test.sh'];
+    await this.startAndWaitForPorts({ ports: [9000, 4000] });
+
+    const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+    await socket.opened;
+
+    const server = new HranaServer({
+      readable: socket.readable,
+      writable: socket.writable,
+      sql: wrapSqlStorage(this.ctx.storage.sql),
+    });
+
+    const servePromise = server.serve();
+
+    // Poll for test completion
+    let result: unknown = null;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const resp = await this.containerFetch('http://localhost/results', 4000);
+        const data = (await resp.json()) as { status: string };
+        if (data.status === 'success' || data.status === 'error') {
+          result = data;
+          break;
+        }
+      } catch {
+        // Not ready yet
+      }
+    }
+
+    await socket.close();
+    await servePromise.catch(() => {});
+
+    if (!result) {
+      return { status: 'timeout', error: 'Test did not complete within 30s' };
+    }
+
+    // 3. DO reads the file written by Container
+    try {
+      const content = await this.agentFs.readFile('/from-container.txt', 'utf8');
+      (result as Record<string, unknown>).doReadContainerFile = content;
+    } catch (err) {
+      (result as Record<string, unknown>).doReadContainerFile =
+        `error: ${err instanceof Error ? err.message : err}`;
+    }
+
+    return result;
+  }
+
   async ping(): Promise<string> {
     await this.startAndWaitForPorts({ ports: [9000] });
 
@@ -164,6 +222,16 @@ export class DOFS extends Container<Env> {
       try {
         const result = await this.ping();
         return new Response(result);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(`Error: ${msg}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/sdk-test') {
+      try {
+        const result = await this.sdkTest();
+        return Response.json(result);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return new Response(`Error: ${msg}`, { status: 500 });

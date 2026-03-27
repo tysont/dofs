@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@libsql/client": "^0.17.2",
+    "@tursodatabase/serverless": "^0.2.4",
+    "agentfs-sdk": "^0.6.4",
     "ws": "^8.20.0"
   }
 }
