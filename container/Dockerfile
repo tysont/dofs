@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-# Install FUSE, git, python, and common agent tools
+# Install FUSE, git, python, and common tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     bash \

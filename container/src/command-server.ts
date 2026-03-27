@@ -1,11 +1,11 @@
-// ABOUTME: HTTP server that executes shell commands with cwd=/agent (the FUSE mount).
+// ABOUTME: HTTP server that executes shell commands with cwd=/volume (the FUSE mount).
 // ABOUTME: Exposes POST /exec for running git, python, bash, etc. against the mounted filesystem.
 
 import { createServer } from 'http';
 import { spawn } from 'child_process';
 
 const PORT = 4000;
-const CWD = '/agent';
+const CWD = '/volume';
 
 const server = createServer(async (req, res) => {
   // Health check

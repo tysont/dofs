@@ -1,19 +1,32 @@
 #!/bin/bash
-# ABOUTME: Starts the bridge, mounts AgentFS via FUSE, and runs the command server.
-# ABOUTME: Bridge relays Hrana between DO TCP and AgentFS's libsql remote connection.
+# ABOUTME: Starts bridge, mounts FUSE via AgentFS, and runs the command server.
+# ABOUTME: Bridge relays Hrana between DO TCP and the FUSE daemon's libsql remote connection.
 
 set -e
 
-MOUNT_POINT="/agent"
+MOUNT_POINT="/volume"
 BRIDGE_WS_URL="ws://localhost:8080"
 
-echo "Starting bridge in background..."
+# -- 1. Start bridge (TCP :9000 ↔ WS :8080) --
+echo "Starting bridge..."
 node /app/dist/bridge.js &
 BRIDGE_PID=$!
 
-# Wait for bridge to start listening
-sleep 2
+# Wait for bridge TCP port to be listening
+echo "Waiting for bridge on port 9000..."
+for i in $(seq 1 30); do
+  if bash -c 'echo >/dev/tcp/localhost/9000' 2>/dev/null; then
+    echo "Bridge ready on port 9000"
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "ERROR: Bridge did not start on port 9000"
+    exit 1
+  fi
+  sleep 1
+done
 
+# -- 2. Mount FUSE via agentfs --
 echo "Creating mount point..."
 mkdir -p "$MOUNT_POINT"
 
@@ -22,12 +35,27 @@ agentfs mount \
     --remote-url "$BRIDGE_WS_URL" \
     --auth-token "" \
     --foreground \
-    agent "$MOUNT_POINT" &
+    volume "$MOUNT_POINT" &
 FUSE_PID=$!
 
-# Wait for mount to establish
-sleep 3
+# Wait for FUSE mount to be ready
+echo "Waiting for FUSE mount..."
+for i in $(seq 1 30); do
+  if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    echo "FUSE mounted at $MOUNT_POINT"
+    break
+  fi
+  if ! kill -0 $FUSE_PID 2>/dev/null; then
+    echo "ERROR: agentfs mount process exited"
+    exit 1
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "WARNING: FUSE mount readiness check timed out, proceeding anyway"
+  fi
+  sleep 1
+done
 
+# -- 3. Start command server --
 echo "Starting command server..."
 node /app/dist/command-server.js &
 CMD_PID=$!

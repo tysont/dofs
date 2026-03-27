@@ -69,7 +69,7 @@ const DDL_STATEMENTS = [
     base_ino INTEGER NOT NULL
   )`,
 
-  // Key-value store for agent state
+  // Key-value store for volume state
   `CREATE TABLE kv_store (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,

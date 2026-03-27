@@ -4,7 +4,7 @@
 
 set -e
 
-WORK_DIR="/agent"
+WORK_DIR="/volume"
 mkdir -p "$WORK_DIR"
 
 echo "Starting bridge in background..."

@@ -46,10 +46,16 @@ export class DOFS extends Container<Env> {
   // Core API
   // ---------------------------------------------------------------------------
 
-  /** Execute a shell command in the Container. */
+  /**
+   * Execute a shell command in the Container against the FUSE-mounted volume.
+   * The FUSE mount is backed by DO SQLite via the Hrana TCP pipe.
+   */
   async exec(command: string): Promise<unknown> {
-    this.entrypoint = ['bash', 'scripts/exec-only.sh'];
+    await this.ensureContainer();
 
+    // containerFetch sends an HTTP request to the Container's command server.
+    // The Hrana server is running concurrently via the event loop, serving
+    // filesystem queries from the FUSE daemon while the command executes.
     const resp = await this.containerFetch(
       new Request('http://localhost/exec', {
         method: 'POST',
@@ -103,17 +109,31 @@ export class DOFS extends Container<Env> {
   // Container lifecycle
   // ---------------------------------------------------------------------------
 
-  /** Start the Container with FUSE mount and Hrana bridge if not already running. */
+  /**
+   * Start the Container with FUSE mount and Hrana bridge if not already running.
+   *
+   * Startup order matters — there's a dependency chain:
+   *   1. Bridge listens on TCP :9000
+   *   2. DO connects TCP and starts HranaServer (serves SQL from DO SQLite)
+   *   3. FUSE daemon connects to bridge WS :8080 → bridge relays to DO via TCP
+   *   4. Command server starts on :4000 after FUSE is mounted
+   *
+   * We wait for :9000 first, connect TCP and start Hrana, then wait for :4000.
+   * If we waited for both ports before connecting TCP, we'd deadlock — FUSE
+   * can't mount without the Hrana connection, and the command server can't
+   * start without FUSE.
+   */
   private async ensureContainer(): Promise<void> {
     if (this.activeServePromise) return;
 
-    this.entrypoint = ['bash', 'scripts/exec-only.sh'];
+    this.entrypoint = ['bash', 'scripts/fuse-mount.sh'];
 
-    // Start the container and wait for ports
-    await this.start();
-    await this.startAndWaitForPorts({ ports: [9000, 4000] });
+    // Wait for bridge TCP port only
+    await this.startAndWaitForPorts({ ports: [9000] });
 
-    // Connect TCP and start the Hrana server
+    // Connect raw TCP and start the Hrana server in the background.
+    // serve() is async and yields on each read — it runs concurrently
+    // with other async work (containerFetch, waitForPort) via the event loop.
     const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
     await socket.opened;
 
@@ -123,7 +143,14 @@ export class DOFS extends Container<Env> {
       sql: wrapSqlStorage(this.ctx.storage.sql),
     });
 
-    this.activeServePromise = server.serve().catch(() => {});
+    this.activeServePromise = server.serve().then(
+      () => { this.activeServePromise = null; },
+      () => { this.activeServePromise = null; }
+    );
+
+    // Now wait for the command server (:4000) which starts after FUSE mounts.
+    // FUSE mounting depends on the Hrana connection we just established above.
+    await this.waitForPort({ portToCheck: 4000 });
   }
 
   // ---------------------------------------------------------------------------
