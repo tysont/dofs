@@ -68,6 +68,66 @@ export class DOFS extends Container<Env> {
     return resp.json();
   }
 
+  /**
+   * Start the bridge + libsql test client, run HranaServer on TCP,
+   * wait for the test to complete, fetch results.
+   */
+  async libsqlTest(): Promise<unknown> {
+    this.entrypoint = ['bash', 'scripts/libsql-test.sh'];
+    await this.startAndWaitForPorts({ ports: [9000, 4000] });
+
+    // Connect raw TCP — bridge is on :9000
+    const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+    await socket.opened;
+
+    // Run Hrana server — serves until bridge/client disconnect
+    const server = new HranaServer({
+      readable: socket.readable,
+      writable: socket.writable,
+      sql: wrapSqlStorage(this.ctx.storage.sql),
+    });
+
+    // Don't await serve() — it blocks until the TCP closes.
+    // Poll the test results endpoint instead.
+    const servePromise = server.serve();
+
+    // Poll for test completion
+    let result: unknown = null;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const resp = await this.containerFetch('http://localhost/results', 4000);
+        const data = (await resp.json()) as { status: string };
+        if (data.status === 'success' || data.status === 'error') {
+          result = data;
+          break;
+        }
+      } catch {
+        // Bridge or test not ready yet
+      }
+    }
+
+    // Close the TCP socket to end the Hrana server
+    await socket.close();
+    await servePromise.catch(() => {});
+
+    if (!result) {
+      return { status: 'timeout', error: 'Test did not complete within 30s' };
+    }
+
+    // Cross-check: read the test data from DO side
+    try {
+      const row = this.ctx.storage.sql
+        .exec<{ msg: string }>("SELECT msg FROM libsql_test WHERE id=1")
+        .one();
+      (result as Record<string, unknown>).doSideRead = row.msg;
+    } catch {
+      (result as Record<string, unknown>).doSideRead = 'table not found';
+    }
+
+    return result;
+  }
+
   async ping(): Promise<string> {
     await this.startAndWaitForPorts({ ports: [9000] });
 
@@ -100,6 +160,16 @@ export class DOFS extends Container<Env> {
       try {
         const result = await this.ping();
         return new Response(result);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(`Error: ${msg}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/libsql-test') {
+      try {
+        const result = await this.libsqlTest();
+        return Response.json(result);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return new Response(`Error: ${msg}`, { status: 500 });

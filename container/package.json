@@ -1,6 +1,7 @@
 {
   "name": "dofs-container",
   "private": true,
+  "type": "module",
   "scripts": {
     "build": "tsc"
   },
@@ -10,6 +11,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.2",
     "ws": "^8.20.0"
   }
 }
