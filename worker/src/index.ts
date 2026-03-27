@@ -14,7 +14,7 @@ export class DOFS extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = '30m';
 
-  private fs: AgentFS;
+  private fs!: AgentFS;
 
   // Track the active Hrana serve promise so we don't open multiple TCP connections
   private activeServePromise: Promise<void> | null = null;
@@ -23,8 +23,10 @@ export class DOFS extends Container<Env> {
     super(ctx as never, env);
     this.ctx.blockConcurrencyWhile(async () => {
       initSchema(this.ctx.storage.sql);
+      // AgentFS.create() must run after initSchema so it finds existing tables
+      // rather than creating its own partial set
+      this.fs = AgentFS.create(this.ctx.storage as unknown as CloudflareStorage);
     });
-    this.fs = AgentFS.create(this.ctx.storage as unknown as CloudflareStorage);
   }
 
   override onStart() {
@@ -44,9 +46,9 @@ export class DOFS extends Container<Env> {
   // Core API
   // ---------------------------------------------------------------------------
 
-  /** Execute a shell command in the Container against the FUSE-mounted filesystem. */
+  /** Execute a shell command in the Container. */
   async exec(command: string): Promise<unknown> {
-    await this.ensureContainer();
+    this.entrypoint = ['bash', 'scripts/exec-only.sh'];
 
     const resp = await this.containerFetch(
       new Request('http://localhost/exec', {
@@ -79,10 +81,14 @@ export class DOFS extends Container<Env> {
   dbInfo(): Record<string, number> {
     const result: Record<string, number> = {};
     for (const table of SCHEMA_TABLES) {
-      const row = this.ctx.storage.sql
-        .exec<{ count: number }>(`SELECT count(*) as count FROM ${table}`)
-        .one();
-      result[table] = row.count;
+      try {
+        const row = this.ctx.storage.sql
+          .exec<{ count: number }>(`SELECT count(*) as count FROM ${table}`)
+          .one();
+        result[table] = row.count;
+      } catch {
+        // Table may not exist yet
+      }
     }
     return result;
   }
@@ -99,21 +105,25 @@ export class DOFS extends Container<Env> {
 
   /** Start the Container with FUSE mount and Hrana bridge if not already running. */
   private async ensureContainer(): Promise<void> {
-    this.entrypoint = ['bash', 'scripts/fuse-mount.sh'];
+    if (this.activeServePromise) return;
+
+    this.entrypoint = ['bash', 'scripts/exec-only.sh'];
+
+    // Start the container and wait for ports
+    await this.start();
     await this.startAndWaitForPorts({ ports: [9000, 4000] });
 
-    if (!this.activeServePromise) {
-      const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
-      await socket.opened;
+    // Connect TCP and start the Hrana server
+    const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+    await socket.opened;
 
-      const server = new HranaServer({
-        readable: socket.readable,
-        writable: socket.writable,
-        sql: wrapSqlStorage(this.ctx.storage.sql),
-      });
+    const server = new HranaServer({
+      readable: socket.readable,
+      writable: socket.writable,
+      sql: wrapSqlStorage(this.ctx.storage.sql),
+    });
 
-      this.activeServePromise = server.serve().catch(() => {});
-    }
+    this.activeServePromise = server.serve().catch(() => {});
   }
 
   // ---------------------------------------------------------------------------
