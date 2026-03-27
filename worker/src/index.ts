@@ -3,6 +3,7 @@
 
 import { Container, getContainer } from '@cloudflare/containers';
 import { initSchema, SCHEMA_TABLES } from './schema';
+import { HranaServer, wrapSqlStorage } from './hrana-server';
 
 interface Env {
   DOFS: DurableObjectNamespace<DOFS>;
@@ -42,6 +43,31 @@ export class DOFS extends Container<Env> {
     return result;
   }
 
+  /**
+   * Start the Container with the Hrana test client, connect raw TCP,
+   * run HranaServer on the stream, then fetch results from the Container.
+   */
+  async hranaTest(): Promise<unknown> {
+    this.entrypoint = ['node', 'dist/hrana-test-client.js'];
+    await this.startAndWaitForPorts({ ports: [9000, 8080] });
+
+    // Connect raw TCP to Container port 9000
+    const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+    await socket.opened;
+
+    // Run the Hrana server on the TCP stream — serves SQL until client disconnects
+    const server = new HranaServer({
+      readable: socket.readable,
+      writable: socket.writable,
+      sql: wrapSqlStorage(this.ctx.storage.sql),
+    });
+    await server.serve();
+
+    // Container test client exposes results via HTTP on :8080
+    const resp = await this.containerFetch('http://localhost/results', 8080);
+    return resp.json();
+  }
+
   async ping(): Promise<string> {
     await this.startAndWaitForPorts({ ports: [9000] });
 
@@ -74,6 +100,16 @@ export class DOFS extends Container<Env> {
       try {
         const result = await this.ping();
         return new Response(result);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(`Error: ${msg}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/hrana-test') {
+      try {
+        const result = await this.hranaTest();
+        return Response.json(result);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return new Response(`Error: ${msg}`, { status: 500 });
