@@ -1,0 +1,26 @@
+{
+  "name": "dofs",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "containers": [
+    {
+      "class_name": "DOFS",
+      "image": "../container/Dockerfile",
+      "max_instances": 10
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DOFS",
+        "class_name": "DOFS"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DOFS"]
+    }
+  ]
+}

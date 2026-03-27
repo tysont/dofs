@@ -1,0 +1,19 @@
+{
+  "name": "dofs-worker",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260317.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0",
+    "wrangler": "^4.14.0"
+  }
+}
