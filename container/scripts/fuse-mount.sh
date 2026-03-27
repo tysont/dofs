@@ -1,5 +1,5 @@
 #!/bin/bash
-# ABOUTME: Starts the bridge and mounts AgentFS via FUSE against the remote DO database.
+# ABOUTME: Starts the bridge, mounts AgentFS via FUSE, and runs the command server.
 # ABOUTME: Bridge relays Hrana between DO TCP and AgentFS's libsql remote connection.
 
 set -e
@@ -18,8 +18,6 @@ echo "Creating mount point..."
 mkdir -p "$MOUNT_POINT"
 
 echo "Mounting AgentFS at $MOUNT_POINT via $BRIDGE_WS_URL..."
-# -f = foreground (keeps process alive in container)
-# auth-token is empty string since our Hrana server doesn't require auth
 agentfs mount \
     --remote-url "$BRIDGE_WS_URL" \
     --auth-token "" \
@@ -30,30 +28,11 @@ FUSE_PID=$!
 # Wait for mount to establish
 sleep 3
 
-# Verify mount
-if mountpoint -q "$MOUNT_POINT" 2>/dev/null || ls "$MOUNT_POINT" >/dev/null 2>&1; then
-    echo "FUSE mount established at $MOUNT_POINT"
-else
-    echo "Warning: mount may not be ready yet"
-fi
+echo "Starting command server..."
+node /app/dist/command-server.js &
+CMD_PID=$!
 
-# Start status server on :4000
-node -e "
-const http = require('http');
-const { execSync } = require('child_process');
-http.createServer((req, res) => {
-    let status = { mounted: false, entries: [] };
-    try {
-        execSync('ls $MOUNT_POINT', { timeout: 5000 });
-        status.mounted = true;
-        status.entries = execSync('ls $MOUNT_POINT', { encoding: 'utf-8', timeout: 5000 }).trim().split('\n').filter(Boolean);
-    } catch (e) {
-        status.error = e.message;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(status));
-}).listen(4000, '0.0.0.0', () => console.log('Status server on :4000'));
-" &
+echo "All services running (bridge=$BRIDGE_PID, fuse=$FUSE_PID, cmd=$CMD_PID)"
 
 # Wait for any child to exit
-wait $BRIDGE_PID $FUSE_PID
+wait $BRIDGE_PID $FUSE_PID $CMD_PID

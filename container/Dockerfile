@@ -1,9 +1,12 @@
 FROM node:22-slim
 
-# Install FUSE support for AgentFS mount
+# Install FUSE, git, python, and common agent tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     bash \
+    git \
+    python3 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

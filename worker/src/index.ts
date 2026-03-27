@@ -242,6 +242,45 @@ export class DOFS extends Container<Env> {
     return result;
   }
 
+  /**
+   * Execute a shell command in the Container against the FUSE-mounted filesystem.
+   * Starts Container if not running, connects Hrana, sends command via HTTP.
+   */
+  async exec(command: string): Promise<unknown> {
+    // Start Container with FUSE mount if not already running
+    this.entrypoint = ['bash', 'scripts/fuse-mount.sh'];
+    await this.startAndWaitForPorts({ ports: [9000, 4000] });
+
+    // Ensure Hrana server is running on the TCP stream
+    if (!this.activeServePromise) {
+      const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+      await socket.opened;
+
+      const server = new HranaServer({
+        readable: socket.readable,
+        writable: socket.writable,
+        sql: wrapSqlStorage(this.ctx.storage.sql),
+      });
+
+      this.activeServePromise = server.serve().catch(() => {});
+    }
+
+    // Send command to the Container's command server
+    const resp = await this.containerFetch(
+      new Request('http://localhost/exec', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command }),
+      }),
+      4000
+    );
+
+    return resp.json();
+  }
+
+  // Track the active Hrana serve promise so we don't open multiple TCP connections
+  private activeServePromise: Promise<void> | null = null;
+
   async ping(): Promise<string> {
     await this.startAndWaitForPorts({ ports: [9000] });
 
@@ -274,6 +313,28 @@ export class DOFS extends Container<Env> {
       try {
         const result = await this.ping();
         return new Response(result);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(`Error: ${msg}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/exec' && request.method === 'POST') {
+      try {
+        const body = (await request.json()) as { command: string };
+        const result = await this.exec(body.command);
+        return Response.json(result);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return new Response(`Error: ${msg}`, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/destroy' && request.method === 'POST') {
+      try {
+        await this.destroy();
+        this.activeServePromise = null;
+        return new Response('ok');
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         return new Response(`Error: ${msg}`, { status: 500 });
