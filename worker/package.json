@@ -8,7 +8,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.2.0"
+    "@cloudflare/containers": "^0.2.0",
+    "agentfs-sdk": "^0.6.4"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260317.1",

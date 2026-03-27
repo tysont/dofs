@@ -2,6 +2,7 @@
 // ABOUTME: Routes HTTP requests to per-agent DOs that communicate with Containers via raw TCP.
 
 import { Container, getContainer } from '@cloudflare/containers';
+import { AgentFS, type CloudflareStorage } from 'agentfs-sdk/cloudflare';
 import { initSchema, SCHEMA_TABLES } from './schema';
 import { HranaServer, wrapSqlStorage } from './hrana-server';
 
@@ -13,11 +14,14 @@ export class DOFS extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = '30m';
 
+  private agentFs: AgentFS;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx as never, env);
     this.ctx.blockConcurrencyWhile(async () => {
       initSchema(this.ctx.storage.sql);
     });
+    this.agentFs = AgentFS.create(this.ctx.storage as unknown as CloudflareStorage);
   }
 
   override onStart() {
@@ -189,6 +193,58 @@ export class DOFS extends Container<Env> {
     if (url.pathname === '/db-info') {
       const info = this.dbInfo();
       return Response.json(info);
+    }
+
+    // -- Filesystem endpoints (AgentFS SDK, no Container needed) --
+
+    if (url.pathname === '/fs/write' && request.method === 'POST') {
+      const path = url.searchParams.get('path');
+      if (!path) return new Response('Missing ?path=', { status: 400 });
+      const content = await request.text();
+      await this.agentFs.writeFile(path, content);
+      return new Response('ok');
+    }
+
+    if (url.pathname === '/fs/read') {
+      const path = url.searchParams.get('path');
+      if (!path) return new Response('Missing ?path=', { status: 400 });
+      try {
+        const content = await this.agentFs.readFile(path, 'utf8');
+        return new Response(content);
+      } catch (err) {
+        return new Response(
+          `Error: ${err instanceof Error ? err.message : err}`,
+          { status: 404 }
+        );
+      }
+    }
+
+    if (url.pathname === '/fs/ls') {
+      const path = url.searchParams.get('path') ?? '/';
+      const entries = await this.agentFs.readdir(path);
+      return Response.json(entries);
+    }
+
+    if (url.pathname === '/kv/set' && request.method === 'POST') {
+      const key = url.searchParams.get('key');
+      if (!key) return new Response('Missing ?key=', { status: 400 });
+      const value = await request.text();
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO kv_store (key, value, created_at, updated_at) VALUES (?, ?, unixepoch(), unixepoch())",
+        key,
+        value
+      );
+      return new Response('ok');
+    }
+
+    if (url.pathname === '/kv/get') {
+      const key = url.searchParams.get('key');
+      if (!key) return new Response('Missing ?key=', { status: 400 });
+      const rows = this.ctx.storage.sql
+        .exec<{ value: string }>("SELECT value FROM kv_store WHERE key = ?", key)
+        .toArray();
+      if (rows.length === 0) return new Response('Not found', { status: 404 });
+      return new Response(rows[0].value);
     }
 
     return new Response('Not found', { status: 404 });
