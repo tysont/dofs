@@ -74,7 +74,7 @@ export class DOFS extends Container<Env> {
           .one();
         result[table] = row.count;
       } catch {
-        // Table may not exist yet
+        // Table may not exist if AgentFS.create() hasn't run yet
       }
     }
     return result;
@@ -98,6 +98,9 @@ export class DOFS extends Container<Env> {
    *   2. POST /setup → bridge starts in-process (ports 9000 + 8080)
    *   3. DO connects TCP to :9000, starts HranaServer
    *   4. POST /mount → agentfs FUSE daemon at /volume
+   *
+   * If the Hrana TCP connection drops (container eviction, crash),
+   * activeServePromise resets to null so the next call reconnects.
    */
   private async ensureContainer(): Promise<void> {
     if (this.activeServePromise) return;
@@ -117,7 +120,9 @@ export class DOFS extends Container<Env> {
       throw new Error(`Bridge setup failed: ${setupResult.error}`);
     }
 
-    // 3. Connect TCP to bridge, start Hrana server in background
+    // 3. Connect TCP to bridge, start Hrana server in background.
+    // On TCP close or error, reset activeServePromise so the next
+    // ensureContainer() call reconnects instead of returning early.
     const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
     await socket.opened;
 
@@ -137,17 +142,38 @@ export class DOFS extends Container<Env> {
     this.containerFetch(
       new Request('http://localhost/mount', { method: 'POST' }),
       4000
-    ).catch(() => {});
+    ).catch(() => {
+      // Mount request itself failing is not fatal — the health poll below
+      // will detect whether the mount actually succeeded.
+    });
 
+    // Poll until FUSE is mounted or we give up. The health endpoint checks
+    // mountpoint -q and reports fuseExitCode if the daemon crashed.
+    let mounted = false;
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 1000));
       try {
         const healthResp = await this.containerFetch('http://localhost/health', 4000);
-        const health = (await healthResp.json()) as { fuseMounted?: boolean };
-        if (health.fuseMounted) break;
-      } catch {
-        // Container not ready yet
+        const health = (await healthResp.json()) as {
+          fuseMounted?: boolean;
+          fuseExitCode?: number | null;
+        };
+        if (health.fuseMounted) {
+          mounted = true;
+          break;
+        }
+        // If daemon exited, stop polling
+        if (health.fuseExitCode !== null && health.fuseExitCode !== undefined) {
+          throw new Error(`FUSE daemon exited with code ${health.fuseExitCode}`);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith('FUSE daemon')) throw err;
+        // Container not ready yet — keep polling
       }
+    }
+
+    if (!mounted) {
+      throw new Error('FUSE mount did not complete within 30 seconds');
     }
   }
 

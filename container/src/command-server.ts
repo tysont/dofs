@@ -7,11 +7,16 @@ import { mkdirSync } from 'fs';
 
 const PORT = 4000;
 const MOUNT_POINT = '/volume';
+const MOUNT_POLL_INTERVAL_MS = 1000;
+const MOUNT_POLL_MAX_ATTEMPTS = 30;
+const EXEC_TIMEOUT_MS = 120_000;
+const EXEC_MAX_BUFFER = 10 * 1024 * 1024;
 
 let cwd = '/tmp';
 let bridgeStarted = false;
 let fuseProcess: ChildProcess | null = null;
 let fuseExitCode: number | null = null;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -22,14 +27,17 @@ function isMounted(): Promise<boolean> {
   });
 }
 
+/** Check whether the FUSE daemon is alive. Returns error message if dead. */
+function fuseDaemonError(): string | null {
+  if (!fuseProcess) return 'FUSE daemon not started';
+  if (fuseExitCode !== null) return `FUSE daemon exited with code ${fuseExitCode}`;
+  return null;
+}
+
 const server = createServer(async (req, res) => {
-  // -- Health check --
   if (req.method === 'GET' && req.url === '/health') {
     const mounted = await isMounted();
-    // Update CWD if mount appeared
-    if (mounted && cwd !== MOUNT_POINT) {
-      cwd = MOUNT_POINT;
-    }
+    if (mounted && cwd !== MOUNT_POINT) cwd = MOUNT_POINT;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -41,11 +49,10 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // -- Setup: start bridge in-process --
   if (req.method === 'POST' && req.url === '/setup') {
     if (bridgeStarted) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, message: 'already started' }));
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -57,29 +64,21 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true }));
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      }));
+      res.end(JSON.stringify({ ok: false, error: `Bridge startup failed: ${err instanceof Error ? err.message : err}` }));
     }
     return;
   }
 
-  // -- Mount: start agentfs FUSE daemon --
   if (req.method === 'POST' && req.url === '/mount') {
     if (fuseProcess && fuseExitCode === null) {
-      // Already running — check if mounted
       const mounted = await isMounted();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, mounted, message: 'already running' }));
+      res.end(JSON.stringify({ ok: true, mounted }));
       return;
     }
 
-    try {
-      mkdirSync(MOUNT_POINT, { recursive: true });
-    } catch { /* exists */ }
+    try { mkdirSync(MOUNT_POINT, { recursive: true }); } catch { /* exists */ }
 
-    // Spawn agentfs mount as a tracked child process
     fuseExitCode = null;
     const child = exec(
       `agentfs mount --remote-url http://localhost:8080 --auth-token "" --foreground volume ${MOUNT_POINT}`,
@@ -90,45 +89,39 @@ const server = createServer(async (req, res) => {
     child.stdout?.on('data', (d: string) => process.stdout.write(`[fuse] ${d}`));
     child.stderr?.on('data', (d: string) => process.stderr.write(`[fuse] ${d}`));
     child.on('exit', (code) => {
-      console.log(`[fuse] exited with code ${code}`);
       fuseExitCode = code ?? 1;
     });
 
-    // Poll for mount readiness
     let mounted = false;
-    for (let i = 0; i < 30; i++) {
-      await sleep(1000);
+    for (let i = 0; i < MOUNT_POLL_MAX_ATTEMPTS; i++) {
+      await sleep(MOUNT_POLL_INTERVAL_MS);
       if (fuseExitCode !== null) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          ok: false,
-          error: `agentfs mount exited with code ${fuseExitCode}`,
-        }));
+        res.end(JSON.stringify({ ok: false, error: `agentfs exited with code ${fuseExitCode}` }));
         return;
       }
       mounted = await isMounted();
       if (mounted) break;
     }
 
-    if (mounted) {
-      cwd = MOUNT_POINT;
-    } else if (fuseExitCode === null) {
-      // Process still running but mount not detected yet — set CWD optimistically
-      // The mount may succeed shortly after the poll timeout
-      cwd = MOUNT_POINT;
-    }
+    if (mounted || fuseExitCode === null) cwd = MOUNT_POINT;
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: mounted || fuseExitCode === null, mounted }));
     return;
   }
 
-  // -- Exec: run a shell command --
   if (req.method === 'POST' && req.url === '/exec') {
-    let body = '';
-    for await (const chunk of req) {
-      body += chunk;
+    // Check FUSE health before executing
+    const fuseErr = fuseDaemonError();
+    if (cwd === MOUNT_POINT && fuseErr) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `FUSE unavailable: ${fuseErr}` }));
+      return;
     }
+
+    let body = '';
+    for await (const chunk of req) body += chunk;
 
     let command: string;
     try {
@@ -136,23 +129,24 @@ const server = createServer(async (req, res) => {
       command = parsed.command;
       if (typeof command !== 'string' || !command.trim()) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing "command" string' }));
+        res.end(JSON.stringify({ error: 'Missing "command" string in request body' }));
         return;
       }
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      res.end(JSON.stringify({ error: 'Invalid JSON in request body' }));
       return;
     }
 
     exec(command, {
       cwd,
+      timeout: EXEC_TIMEOUT_MS,
       env: {
         ...process.env,
         HOME: '/root',
         PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       },
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: EXEC_MAX_BUFFER,
     }, (error, stdout, stderr) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -168,6 +162,4 @@ const server = createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Command server listening on :${PORT}`);
-});
+server.listen(PORT, '0.0.0.0');
