@@ -48,22 +48,32 @@ The first exec cold-starts a Container and mounts the volume via FUSE (~30s). Su
 The Container has git, python3, and standard Linux utilities:
 
 ```bash
-# Initialize a git repo on the volume
-curl -X POST "$BASE/exec?volume=myproject" \
-  -H "Content-Type: application/json" \
-  -d '{"command": "cd /volume && git init && echo \"print(42)\" > main.py && git add -A && git -c user.name=dofs -c user.email=dofs@test commit -m \"initial\""}'
-# {"exitCode":0,"stdout":"Initialized empty Git repository in /volume/.git/\n[main (root-commit) a1b2c3d] initial\n...","stderr":""}
+# Write a Python script via the DO SDK (fast, no Container needed)
+curl -X POST "$BASE/fs/write?volume=myproject&path=/main.py" -d 'print(42)'
 
-# Run Python
+# Run it inside the Container
 curl -X POST "$BASE/exec?volume=myproject" \
   -H "Content-Type: application/json" \
   -d '{"command": "python3 /volume/main.py"}'
 # {"exitCode":0,"stdout":"42\n","stderr":""}
 
+# Initialize a git repo (git init is slow on FUSE due to many small file writes;
+# use --template= to skip hook templates and speed it up)
+curl -X POST "$BASE/exec?volume=myproject" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "cd /volume && git init --template= && git add -A && git -c user.name=dofs -c user.email=dofs@test commit -m initial 2>&1"}'
+# {"exitCode":0,"stdout":"Initialized empty Git repository in /volume/.git/\n[master ...] initial\n...","stderr":""}
+
 # Verify from the DO side
 curl "$BASE/fs/ls?volume=myproject&path=/"
 # [".git","config.json","main.py"]
 ```
+
+### Performance
+
+DOFS is well-suited for agent workloads that are read-heavy with moderate writes — running scripts, reading configs, writing output files. Every FUSE operation is a network round-trip (kernel → agentfs → HTTP → bridge → TCP → DO → SQLite → back), so metadata-heavy operations like `git init` that create hundreds of small files are slow (~60s).
+
+For best performance, write files via `/fs/write` (direct DO access, no FUSE overhead) and use `/exec` for computation against those files.
 
 ### Data persists across Container destruction
 
