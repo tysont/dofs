@@ -86,24 +86,6 @@ For best results with the current architecture:
 - **Write files via `/fs/write`** — this hits DO SQLite directly with no FUSE overhead
 - **Use `/exec` for computation** — run scripts, compilers, tools against files already on the volume
 - **Avoid metadata-heavy tools in FUSE** — prefer writing project scaffolding via the DO SDK, then using exec for builds/runs
-### Data persists across Container destruction
-
-```bash
-# Kill the Container
-curl -X POST "$BASE/destroy?volume=myproject"
-# ok
-
-# Data is still there (read directly from DO SQLite, no Container needed)
-curl "$BASE/fs/read?volume=myproject&path=/main.py"
-# print(42)
-
-# Start a new Container — previous data is visible via FUSE
-curl -X POST "$BASE/exec?volume=myproject" \
-  -H "Content-Type: application/json" \
-  -d '{"command": "cat /volume/main.py && git -C /volume log --oneline"}'
-# {"exitCode":0,"stdout":"print(42)\na1b2c3d initial\n","stderr":""}
-```
-
 ### KV store
 
 Each volume also has a simple key-value store:
