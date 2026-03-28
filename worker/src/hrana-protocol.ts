@@ -1,8 +1,8 @@
-// ABOUTME: Hrana 3 protocol types, serialization, and TCP frame buffering.
-// ABOUTME: Implements the subset needed for DO↔Container communication.
+// ABOUTME: Hrana pipeline protocol types and TCP frame serialization.
+// ABOUTME: Implements the HTTP pipeline format used by libsql's remote client.
 
 // ---------------------------------------------------------------------------
-// SQL Value encoding — matches Hrana 3 spec exactly
+// SQL Value encoding — matches Hrana spec (tagged union, integer as string)
 // ---------------------------------------------------------------------------
 
 export type HranaValue =
@@ -29,11 +29,16 @@ export interface Col {
   decltype: string | null;
 }
 
+export interface Row {
+  values: HranaValue[];
+}
+
 export interface StmtResult {
   cols: Col[];
-  rows: HranaValue[][];
+  rows: Row[];
   affected_row_count: number;
   last_insert_rowid: string | null;
+  replication_index: string | null;
   rows_read: number;
   rows_written: number;
   query_duration_ms: number;
@@ -48,6 +53,15 @@ export interface HranaError {
 // Batch types
 // ---------------------------------------------------------------------------
 
+export interface Batch {
+  steps: BatchStep[];
+}
+
+export interface BatchStep {
+  condition?: BatchCond | null;
+  stmt: Stmt;
+}
+
 export type BatchCond =
   | { type: 'ok'; step: number }
   | { type: 'error'; step: number }
@@ -56,132 +70,103 @@ export type BatchCond =
   | { type: 'or'; conds: BatchCond[] }
   | { type: 'is_autocommit' };
 
-export interface BatchStep {
-  condition?: BatchCond | null;
-  stmt: Stmt;
-}
-
-export interface Batch {
-  steps: BatchStep[];
-}
-
 export interface BatchResult {
   step_results: (StmtResult | null)[];
   step_errors: (HranaError | null)[];
 }
 
 // ---------------------------------------------------------------------------
-// Request bodies (client → server, inside a "request" wrapper)
+// Pipeline request/response (the HTTP pipeline API format)
 // ---------------------------------------------------------------------------
 
-export type HranaRequest =
-  | { type: 'open_stream'; stream_id: number }
-  | { type: 'close_stream'; stream_id: number }
-  | { type: 'execute'; stream_id: number; stmt: Stmt }
-  | { type: 'batch'; stream_id: number; batch: Batch };
+export type StreamRequest =
+  | { type: 'close' }
+  | { type: 'execute'; stmt: Stmt }
+  | { type: 'batch'; batch: Batch }
+  | { type: 'get_autocommit' }
+  | { type: 'sequence'; sql?: string | null; sql_id?: number | null }
+  | { type: 'store_sql'; sql: string; sql_id: number }
+  | { type: 'close_sql'; sql_id: number }
+  | { type: 'describe'; sql?: string | null; sql_id?: number | null };
 
-// ---------------------------------------------------------------------------
-// Response bodies (server → client, inside a "response_ok" wrapper)
-// ---------------------------------------------------------------------------
-
-export type HranaResponse =
-  | { type: 'open_stream' }
-  | { type: 'close_stream' }
+export type StreamResponse =
+  | { type: 'close' }
   | { type: 'execute'; result: StmtResult }
-  | { type: 'batch'; result: BatchResult };
+  | { type: 'batch'; result: BatchResult }
+  | { type: 'get_autocommit'; is_autocommit: boolean }
+  | { type: 'sequence' }
+  | { type: 'store_sql' }
+  | { type: 'close_sql' }
+  | { type: 'describe'; result: unknown };
+
+export type StreamResult =
+  | { type: 'ok'; response: StreamResponse }
+  | { type: 'error'; error: HranaError }
+  | { type: 'none' };
+
+export interface PipelineRequest {
+  baton: string | null;
+  requests: StreamRequest[];
+}
+
+export interface PipelineResponse {
+  baton: string | null;
+  base_url: string | null;
+  results: StreamResult[];
+}
 
 // ---------------------------------------------------------------------------
-// Top-level messages (one per WebSocket frame / TCP length-prefixed frame)
-// ---------------------------------------------------------------------------
-
-export type ClientMessage =
-  | { type: 'hello'; jwt: string | null }
-  | { type: 'request'; request_id: number; request: HranaRequest };
-
-export type ServerMessage =
-  | { type: 'hello_ok' }
-  | { type: 'hello_error'; error: HranaError }
-  | { type: 'response_ok'; request_id: number; response: HranaResponse }
-  | { type: 'response_error'; request_id: number; error: HranaError };
-
-export type HranaMessage = ClientMessage | ServerMessage;
-
-// ---------------------------------------------------------------------------
-// Frame serialization: 4-byte big-endian length prefix + JSON
+// TCP frame serialization: 4-byte big-endian length prefix + JSON
 // ---------------------------------------------------------------------------
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const HEADER_SIZE = 4;
 
-/**
- * Serialize a Hrana message into a length-prefixed frame.
- * Format: [4 bytes big-endian uint32 length][JSON UTF-8 bytes]
- */
-export function serializeFrame(msg: HranaMessage): Uint8Array {
+/** Serialize a message into a length-prefixed frame. */
+export function serializeFrame(msg: unknown): Uint8Array {
   const json = encoder.encode(JSON.stringify(msg));
   const frame = new Uint8Array(HEADER_SIZE + json.length);
   const view = new DataView(frame.buffer);
-  view.setUint32(0, json.length, false); // big-endian
+  view.setUint32(0, json.length, false);
   frame.set(json, HEADER_SIZE);
   return frame;
 }
 
-/**
- * Try to deserialize one frame from a buffer starting at `offset`.
- * Returns null if there isn't enough data for a complete frame.
- */
+/** Try to deserialize one frame from a buffer at offset. Returns null if incomplete. */
 export function deserializeFrame(
   buf: Uint8Array,
   offset: number
-): { msg: HranaMessage; bytesConsumed: number } | null {
+): { msg: unknown; bytesConsumed: number } | null {
   const remaining = buf.length - offset;
   if (remaining < HEADER_SIZE) return null;
 
   const view = new DataView(buf.buffer, buf.byteOffset + offset, remaining);
-  const jsonLength = view.getUint32(0, false); // big-endian
+  const jsonLength = view.getUint32(0, false);
 
   if (remaining < HEADER_SIZE + jsonLength) return null;
 
-  const jsonBytes = buf.subarray(
-    offset + HEADER_SIZE,
-    offset + HEADER_SIZE + jsonLength
-  );
-  const msg = JSON.parse(decoder.decode(jsonBytes)) as HranaMessage;
+  const jsonBytes = buf.subarray(offset + HEADER_SIZE, offset + HEADER_SIZE + jsonLength);
+  const msg = JSON.parse(decoder.decode(jsonBytes));
 
   return { msg, bytesConsumed: HEADER_SIZE + jsonLength };
 }
 
-// ---------------------------------------------------------------------------
-// FrameBuffer: accumulates TCP chunks, yields complete Hrana messages
-// ---------------------------------------------------------------------------
-
-/**
- * Buffers incoming TCP data and extracts complete length-prefixed Hrana
- * frames. Handles the reality that TCP chunks don't align with message
- * boundaries — a chunk may contain half a frame, multiple frames, or
- * a frame split across chunks.
- */
+/** Accumulates TCP chunks and yields complete frames. */
 export class FrameBuffer {
   private chunks: Uint8Array[] = [];
   private totalLength = 0;
 
-  /** Add a chunk of data received from the TCP stream. */
   push(chunk: Uint8Array): void {
     this.chunks.push(chunk);
     this.totalLength += chunk.length;
   }
 
-  /**
-   * Extract all complete messages from the buffer.
-   * Partial trailing data is retained for the next push+drain cycle.
-   */
-  drain(): HranaMessage[] {
+  drain(): unknown[] {
     if (this.totalLength < HEADER_SIZE) return [];
 
-    // Consolidate chunks into a single contiguous buffer for parsing
     const buf = this.consolidate();
-    const messages: HranaMessage[] = [];
+    const messages: unknown[] = [];
     let offset = 0;
 
     while (true) {
@@ -191,7 +176,6 @@ export class FrameBuffer {
       offset += result.bytesConsumed;
     }
 
-    // Retain any unconsumed bytes
     if (offset < buf.length) {
       const remainder = buf.slice(offset);
       this.chunks = [remainder];

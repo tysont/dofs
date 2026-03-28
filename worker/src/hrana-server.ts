@@ -1,24 +1,25 @@
-// ABOUTME: Hrana 3 protocol server that executes SQL against a backend.
-// ABOUTME: Reads length-prefixed frames from a stream, dispatches requests, writes responses.
+// ABOUTME: Hrana pipeline server that executes SQL against a backend.
+// ABOUTME: Reads pipeline requests from a TCP stream, executes SQL, writes pipeline responses.
 
 import {
   FrameBuffer,
   serializeFrame,
-  type ClientMessage,
-  type ServerMessage,
-  type HranaRequest,
-  type HranaResponse,
+  type PipelineRequest,
+  type PipelineResponse,
+  type StreamRequest,
+  type StreamResult,
+  type StreamResponse,
   type HranaValue,
   type StmtResult,
   type Stmt,
   type BatchResult,
+  type Row,
 } from './hrana-protocol';
 
 // ---------------------------------------------------------------------------
 // SQL backend interface
 // ---------------------------------------------------------------------------
 
-/** Result of executing a SQL statement against the backend. */
 export interface SqlCursorResult {
   columnNames: string[];
   rows: Record<string, unknown>[];
@@ -26,18 +27,11 @@ export interface SqlCursorResult {
   rowsWritten: number;
 }
 
-/**
- * Minimal SQL execution interface. DO's SqlStorage satisfies this.
- * Tests can provide a better-sqlite3 adapter.
- */
 export interface SqlBackend {
   exec(query: string, ...bindings: unknown[]): SqlCursorResult;
 }
 
-/**
- * Wraps DO SqlStorage into the SqlBackend interface.
- * Call this once and pass the result to HranaServer.
- */
+/** Wraps DO SqlStorage into the SqlBackend interface. */
 export function wrapSqlStorage(sql: {
   exec(query: string, ...bindings: unknown[]): {
     columnNames: string[];
@@ -63,7 +57,6 @@ export function wrapSqlStorage(sql: {
 // Value conversion: Hrana ↔ JS
 // ---------------------------------------------------------------------------
 
-/** Convert a Hrana value to a JS value suitable for SQL binding. */
 function hranaToJs(val: HranaValue): unknown {
   switch (val.type) {
     case 'null':
@@ -75,7 +68,6 @@ function hranaToJs(val: HranaValue): unknown {
     case 'text':
       return val.value;
     case 'blob': {
-      // base64 → Uint8Array (works as binding in both DO SqlStorage and better-sqlite3)
       const binary = atob(val.base64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
@@ -86,7 +78,6 @@ function hranaToJs(val: HranaValue): unknown {
   }
 }
 
-/** Convert a JS value from a SQL result into a Hrana value. */
 function jsToHrana(val: unknown): HranaValue {
   if (val === null || val === undefined) {
     return { type: 'null' };
@@ -111,7 +102,6 @@ function jsToHrana(val: unknown): HranaValue {
     }
     return { type: 'blob', base64: btoa(binary) };
   }
-  // Fallback: coerce to string
   return { type: 'text', value: String(val) };
 }
 
@@ -128,11 +118,6 @@ function executeStmt(sql: SqlBackend, stmt: Stmt): StmtResult {
       bindings.push(hranaToJs(arg));
     }
   }
-  // named_args: convert to positional by extracting values in order.
-  // DO SQLite uses positional ? placeholders, but @libsql/client may send
-  // named args for :name or $name placeholders. For named placeholders in
-  // SQLite, the bindings are still positional — the names map to ?1, ?2, etc.
-  // We append named arg values after any positional args.
   if (stmt.named_args) {
     for (const na of stmt.named_args) {
       bindings.push(hranaToJs(na.value));
@@ -141,17 +126,15 @@ function executeStmt(sql: SqlBackend, stmt: Stmt): StmtResult {
 
   const cursor = sql.exec(query, ...bindings);
 
-  // Convert rows from {colName: value} records to positional HranaValue arrays
   const cols = cursor.columnNames.map((name) => ({
     name,
     decltype: null as string | null,
   }));
 
-  const rows: HranaValue[][] = cursor.rows.map((row) =>
-    cursor.columnNames.map((col) => jsToHrana(row[col]))
-  );
+  const rows: Row[] = cursor.rows.map((row) => ({
+    values: cursor.columnNames.map((col) => jsToHrana(row[col])),
+  }));
 
-  // Determine last_insert_rowid: if rowsWritten > 0, query for it
   let lastInsertRowid: string | null = null;
   if (cursor.rowsWritten > 0) {
     try {
@@ -164,7 +147,7 @@ function executeStmt(sql: SqlBackend, stmt: Stmt): StmtResult {
         }
       }
     } catch {
-      // Ignore — last_insert_rowid not critical
+      // Not critical
     }
   }
 
@@ -173,6 +156,7 @@ function executeStmt(sql: SqlBackend, stmt: Stmt): StmtResult {
     rows,
     affected_row_count: cursor.rowsWritten,
     last_insert_rowid: lastInsertRowid,
+    replication_index: null,
     rows_read: cursor.rowsRead,
     rows_written: cursor.rowsWritten,
     query_duration_ms: 0,
@@ -180,14 +164,14 @@ function executeStmt(sql: SqlBackend, stmt: Stmt): StmtResult {
 }
 
 // ---------------------------------------------------------------------------
-// HranaServer
+// HranaServer — pipeline format
 // ---------------------------------------------------------------------------
 
 export class HranaServer {
   private sql: SqlBackend;
   private readable: ReadableStream<Uint8Array>;
   private writable: WritableStream<Uint8Array>;
-  private openStreams = new Set<number>();
+  private baton: string | null = null;
 
   constructor(opts: {
     readable: ReadableStream<Uint8Array>;
@@ -214,7 +198,7 @@ export class HranaServer {
         const messages = buffer.drain();
 
         for (const msg of messages) {
-          const response = this.handleMessage(msg as ClientMessage);
+          const response = this.handlePipeline(msg as PipelineRequest);
           await writer.write(serializeFrame(response));
         }
       }
@@ -224,67 +208,78 @@ export class HranaServer {
     }
   }
 
-  private handleMessage(msg: ClientMessage): ServerMessage {
-    if (msg.type === 'hello') {
-      return { type: 'hello_ok' };
-    }
+  private handlePipeline(req: PipelineRequest): PipelineResponse {
+    const results: StreamResult[] = [];
 
-    if (msg.type === 'request') {
+    for (const streamReq of req.requests) {
       try {
-        const response = this.handleRequest(msg.request);
-        return {
-          type: 'response_ok',
-          request_id: msg.request_id,
-          response,
-        };
+        const response = this.handleStreamRequest(streamReq);
+        results.push({ type: 'ok', response });
       } catch (err) {
-        return {
-          type: 'response_error',
-          request_id: msg.request_id,
+        results.push({
+          type: 'error',
           error: {
             message: err instanceof Error ? err.message : String(err),
           },
-        };
+        });
       }
     }
 
-    // Unknown message type — return an error if it has a request_id
+    // Generate a baton for session continuity if still open
+    // (close request sets baton to null, and we don't regenerate it)
+    const wasOpen = this.baton !== null || !req.requests.some(r => r.type === 'close');
+    if (wasOpen && !this.baton) {
+      this.baton = 'dofs-1';
+    }
+
     return {
-      type: 'hello_error',
-      error: { message: `Unknown message type: ${(msg as { type: string }).type}` },
+      baton: this.baton,
+      base_url: null,
+      results,
     };
   }
 
-  private handleRequest(req: HranaRequest): HranaResponse {
+  private handleStreamRequest(req: StreamRequest): StreamResponse {
     switch (req.type) {
-      case 'open_stream':
-        this.openStreams.add(req.stream_id);
-        return { type: 'open_stream' };
-
-      case 'close_stream':
-        this.openStreams.delete(req.stream_id);
-        return { type: 'close_stream' };
+      case 'close':
+        this.baton = null;
+        return { type: 'close' };
 
       case 'execute': {
-        this.requireStream(req.stream_id);
         const result = executeStmt(this.sql, req.stmt);
         return { type: 'execute', result };
       }
 
       case 'batch': {
-        this.requireStream(req.stream_id);
         const result = this.executeBatch(req.batch.steps);
         return { type: 'batch', result };
       }
 
-      default:
-        throw new Error(`Unsupported request type: ${(req as { type: string }).type}`);
-    }
-  }
+      case 'get_autocommit':
+        return { type: 'get_autocommit', is_autocommit: true };
 
-  private requireStream(streamId: number): void {
-    if (!this.openStreams.has(streamId)) {
-      throw new Error(`Stream ${streamId} is not open`);
+      case 'sequence': {
+        // Execute SQL without returning results
+        const query = req.sql ?? '';
+        if (query) {
+          this.sql.exec(query);
+        }
+        return { type: 'sequence' };
+      }
+
+      case 'store_sql':
+        // We don't cache SQL statements — just acknowledge
+        return { type: 'store_sql' };
+
+      case 'close_sql':
+        return { type: 'close_sql' };
+
+      case 'describe':
+        // Minimal describe response
+        return { type: 'describe', result: { params: [], cols: [], is_explain: false, is_readonly: false } };
+
+      default:
+        throw new Error(`Unsupported stream request type: ${(req as { type: string }).type}`);
     }
   }
 
@@ -292,10 +287,7 @@ export class HranaServer {
     const stepResults: (StmtResult | null)[] = [];
     const stepErrors: ({ message: string } | null)[] = [];
 
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-
-      // Evaluate condition if present
+    for (const step of steps) {
       if (step.condition && !this.evaluateCondition(step.condition, stepResults, stepErrors)) {
         stepResults.push(null);
         stepErrors.push(null);
@@ -336,9 +328,9 @@ export class HranaServer {
       case 'or':
         return (c.conds ?? []).some((sub) => this.evaluateCondition(sub, results, errors));
       case 'is_autocommit':
-        return true; // DO SQLite is always in autocommit mode
+        return true;
       default:
-        return true; // Unknown condition — execute the step
+        return true;
     }
   }
 }

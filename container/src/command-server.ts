@@ -5,7 +5,7 @@ import { createServer } from 'http';
 import { spawn } from 'child_process';
 
 const PORT = 4000;
-const CWD = '/volume';
+const CWD = '/tmp';
 
 const server = createServer(async (req, res) => {
   // Health check
@@ -62,7 +62,7 @@ interface ExecResult {
 
 function execCommand(command: string): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('bash', ['-c', command], {
+    const child = spawn('/bin/sh', ['-c', command], {
       cwd: CWD,
       env: {
         ...process.env,

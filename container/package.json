@@ -7,13 +7,11 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/ws": "^8.18.1",
     "typescript": "^5.7.0"
   },
   "dependencies": {
     "@libsql/client": "^0.17.2",
     "@tursodatabase/serverless": "^0.2.4",
-    "agentfs-sdk": "^0.6.4",
-    "ws": "^8.20.0"
+    "agentfs-sdk": "^0.6.4"
   }
 }

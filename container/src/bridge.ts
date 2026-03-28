@@ -1,67 +1,68 @@
-// ABOUTME: TCP↔WebSocket bridge for Hrana protocol relay.
-// ABOUTME: TCP :9000 from DO (length-prefixed frames) ↔ WS ws://localhost:8080 for libsql client.
+// ABOUTME: HTTP-to-TCP bridge for Hrana pipeline protocol.
+// ABOUTME: HTTP :8080 serves POST /v3/pipeline from FUSE daemon, relays over TCP :9000 to DO.
 
 import { createServer as createTcpServer, type Socket } from 'net';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { createServer as createHttpServer } from 'http';
 
 const TCP_PORT = 9000;
-const WS_PORT = 8080;
+const HTTP_PORT = 8080;
+const HEADER_SIZE = 4;
 
 // ---------------------------------------------------------------------------
-// State: one TCP connection (from DO), many WS clients (from libsql)
+// TCP connection to the DO (length-prefixed JSON frames)
 // ---------------------------------------------------------------------------
 
 let doSocket: Socket | null = null;
-const wsClients = new Set<WebSocket>();
-
-// Buffer for incomplete TCP frames
 let tcpBuffer = Buffer.alloc(0);
-
-// ---------------------------------------------------------------------------
-// TCP → WS: read length-prefixed frames, forward as WS text messages
-// ---------------------------------------------------------------------------
+let pendingResolve: ((data: Buffer) => void) | null = null;
 
 function handleTcpData(data: Buffer): void {
   tcpBuffer = Buffer.concat([tcpBuffer, data]);
+  tryDeliverFrame();
+}
 
-  while (true) {
-    if (tcpBuffer.length < 4) break;
+function tryDeliverFrame(): void {
+  if (!pendingResolve) return;
+  if (tcpBuffer.length < HEADER_SIZE) return;
 
-    const jsonLen = tcpBuffer.readUInt32BE(0);
-    if (tcpBuffer.length < 4 + jsonLen) break;
+  const jsonLen = tcpBuffer.readUInt32BE(0);
+  if (tcpBuffer.length < HEADER_SIZE + jsonLen) return;
 
-    const jsonStr = tcpBuffer.subarray(4, 4 + jsonLen).toString('utf-8');
-    tcpBuffer = tcpBuffer.subarray(4 + jsonLen);
+  const frame = tcpBuffer.subarray(HEADER_SIZE, HEADER_SIZE + jsonLen);
+  tcpBuffer = tcpBuffer.subarray(HEADER_SIZE + jsonLen);
 
-    // Forward to all connected WS clients
-    for (const ws of wsClients) {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(jsonStr);
-      }
+  const resolve = pendingResolve;
+  pendingResolve = null;
+  resolve(frame);
+}
+
+/** Send a length-prefixed JSON frame over TCP and wait for one response frame. */
+function sendAndReceive(payload: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    if (!doSocket || doSocket.destroyed) {
+      reject(new Error('No DO TCP connection'));
+      return;
     }
-  }
+
+    // Register the pending response handler
+    pendingResolve = resolve;
+
+    // Write the request frame
+    const header = Buffer.alloc(HEADER_SIZE);
+    header.writeUInt32BE(payload.length, 0);
+    doSocket.write(Buffer.concat([header, payload]), (err) => {
+      if (err) {
+        pendingResolve = null;
+        reject(err);
+      }
+    });
+
+    // Check if we already have a buffered response
+    tryDeliverFrame();
+  });
 }
 
-// ---------------------------------------------------------------------------
-// WS → TCP: receive WS text messages, wrap in length-prefixed frames
-// ---------------------------------------------------------------------------
-
-function handleWsMessage(data: string): void {
-  if (!doSocket || doSocket.destroyed) {
-    console.error('No DO TCP connection available');
-    return;
-  }
-
-  const jsonBuf = Buffer.from(data, 'utf-8');
-  const header = Buffer.alloc(4);
-  header.writeUInt32BE(jsonBuf.length, 0);
-  doSocket.write(Buffer.concat([header, jsonBuf]));
-}
-
-// ---------------------------------------------------------------------------
 // TCP server on :9000 — accepts connection from DO
-// ---------------------------------------------------------------------------
-
 const tcpServer = createTcpServer((socket) => {
   console.log('DO connected via TCP');
 
@@ -72,6 +73,7 @@ const tcpServer = createTcpServer((socket) => {
 
   doSocket = socket;
   tcpBuffer = Buffer.alloc(0);
+  pendingResolve = null;
 
   socket.on('data', handleTcpData);
 
@@ -91,36 +93,54 @@ tcpServer.listen(TCP_PORT, '0.0.0.0', () => {
 });
 
 // ---------------------------------------------------------------------------
-// WebSocket server on :8080 — accepts connections from libsql client
+// HTTP server on :8080 — serves Hrana pipeline API for the FUSE daemon
 // ---------------------------------------------------------------------------
 
-const wss = new WebSocketServer({ port: WS_PORT, host: '0.0.0.0' }, () => {
-  console.log(`Bridge WebSocket server listening on :${WS_PORT}`);
-});
-
-wss.on('connection', (ws, req) => {
-  console.log(`WS client connected from ${req.socket.remoteAddress}`);
-
-  // Check for Hrana subprotocol
-  const protocols = req.headers['sec-websocket-protocol'];
-  if (protocols) {
-    console.log(`WS subprotocol requested: ${protocols}`);
+const httpServer = createHttpServer(async (req, res) => {
+  // Health check (used by Container class port readiness)
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+    return;
   }
 
-  wsClients.add(ws);
+  // Hrana pipeline endpoint
+  if (req.method === 'POST' && (req.url === '/v3/pipeline' || req.url?.startsWith('/v3/pipeline'))) {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+    }
 
-  ws.on('message', (data) => {
-    const msg = typeof data === 'string' ? data : data.toString('utf-8');
-    handleWsMessage(msg);
-  });
+    if (!doSocket || doSocket.destroyed) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No DO TCP connection available' }));
+      return;
+    }
 
-  ws.on('close', () => {
-    console.log('WS client disconnected');
-    wsClients.delete(ws);
-  });
+    try {
+      const responseFrame = await sendAndReceive(Buffer.from(body, 'utf-8'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(responseFrame);
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+    return;
+  }
 
-  ws.on('error', (err) => {
-    console.error('WS client error:', err.message);
-    wsClients.delete(ws);
-  });
+  // Cursor endpoint (streaming — not yet implemented)
+  if (req.method === 'POST' && req.url?.startsWith('/v3/cursor')) {
+    res.writeHead(501, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Cursor API not implemented' }));
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
+});
+
+httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+  console.log(`Bridge HTTP server listening on :${HTTP_PORT}`);
 });
