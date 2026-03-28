@@ -26,5 +26,5 @@ RUN chmod +x /usr/local/bin/agentfs
 #   bridge:            ["bash", "scripts/entrypoint.sh"]
 #   fuse-mount:        ["bash", "scripts/fuse-mount.sh"]
 #   hrana-test-client: ["node", "dist/hrana-test-client.js"]
-# force-rebuild-3
+# force-rebuild-2
 CMD ["node", "dist/echo-server.js"]

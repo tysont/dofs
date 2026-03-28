@@ -116,23 +116,69 @@ export class DOFS extends Container<Env> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Start the Container with FUSE mount and Hrana bridge if not already running.
+   * Start the Container and set up bridge + FUSE mount via HTTP calls.
    *
-   * Startup order matters — there's a dependency chain:
-   *   1. Bridge listens on TCP :9000
-   *   2. DO connects TCP and starts HranaServer (serves SQL from DO SQLite)
-   *   3. FUSE daemon connects to bridge WS :8080 → bridge relays to DO via TCP
-   *   4. Command server starts on :4000 after FUSE is mounted
-   *
-   * We wait for :9000 first, connect TCP and start Hrana, then wait for :4000.
-   * If we waited for both ports before connecting TCP, we'd deadlock — FUSE
-   * can't mount without the Hrana connection, and the command server can't
-   * start without FUSE.
+   * The DO drives the sequence:
+   *   1. Container starts with command-server.js (port 4000)
+   *   2. POST /setup → bridge starts in-process (ports 9000 + 8080)
+   *   3. DO connects TCP to :9000, starts HranaServer
+   *   4. POST /mount → agentfs FUSE daemon at /volume
    */
-  /** Start the Container and wait for the command server. */
   private async ensureContainer(): Promise<void> {
-    this.entrypoint = ['node', 'dist/command-server.js'];
+    if (this.activeServePromise) return;
+
+    this.entrypoint = ['node', '/app/dist/command-server.js'];
+
+    // 1. Wait for command server
     await this.startAndWaitForPorts({ ports: [4000] });
+
+    // 2. Start bridge in-process via HTTP
+    const setupResp = await this.containerFetch(
+      new Request('http://localhost/setup', { method: 'POST' }),
+      4000
+    );
+    const setupResult = (await setupResp.json()) as { ok: boolean; error?: string };
+    if (!setupResult.ok) {
+      throw new Error(`Bridge setup failed: ${setupResult.error}`);
+    }
+
+    // 3. Connect TCP to bridge :9000, start Hrana server in background
+    const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
+    await socket.opened;
+
+    const server = new HranaServer({
+      readable: socket.readable,
+      writable: socket.writable,
+      sql: wrapSqlStorage(this.ctx.storage.sql),
+    });
+
+    this.activeServePromise = server.serve().then(
+      () => { this.activeServePromise = null; },
+      () => { this.activeServePromise = null; }
+    );
+
+    // 4. Mount FUSE — fire-and-forget, then poll for readiness.
+    // We can't await the mount response because it blocks for up to 30s
+    // while the FUSE daemon sends Hrana requests that the serve() loop must
+    // handle concurrently. Fire the mount request and poll health instead.
+    this.containerFetch(
+      new Request('http://localhost/mount', { method: 'POST' }),
+      4000
+    ).catch(() => {});
+
+    // Poll health until mount is ready
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const healthResp = await this.containerFetch('http://localhost/health', 4000);
+        const health = (await healthResp.json()) as { fuseMounted?: boolean; cwd?: string };
+        if (health.fuseMounted || health.cwd === '/volume') {
+          break;
+        }
+      } catch {
+        // Not ready yet
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------

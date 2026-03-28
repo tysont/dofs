@@ -2,8 +2,6 @@
 # ABOUTME: Starts bridge, mounts FUSE via AgentFS, and runs the command server.
 # ABOUTME: Bridge relays Hrana pipeline between DO TCP and the FUSE daemon.
 
-set -e
-
 MOUNT_POINT="/volume"
 
 mkdir -p "$MOUNT_POINT"
@@ -13,11 +11,11 @@ echo "Starting bridge..."
 node /app/dist/bridge.js &
 BRIDGE_PID=$!
 
-# Wait for bridge HTTP to be ready
+# Wait for bridge HTTP
 echo "Waiting for bridge on :8080..."
 i=0
 while [ "$i" -lt 15 ]; do
-  if wget -q -O /dev/null http://localhost:8080/ 2>/dev/null; then
+  if node -e "fetch('http://localhost:8080/').then(() => process.exit(0)).catch(() => process.exit(1))" 2>/dev/null; then
     echo "Bridge ready"
     break
   fi
@@ -31,7 +29,7 @@ agentfs mount \
     --remote-url http://localhost:8080 \
     --auth-token "" \
     --foreground \
-    volume "$MOUNT_POINT" &
+    volume "$MOUNT_POINT" 2>&1 &
 FUSE_PID=$!
 
 # Wait for FUSE mount
@@ -42,9 +40,9 @@ while [ "$i" -lt 30 ]; do
     echo "FUSE mounted at $MOUNT_POINT"
     break
   fi
+  # Check if agentfs is still running
   if ! kill -0 $FUSE_PID 2>/dev/null; then
-    echo "ERROR: agentfs mount process exited"
-    # Start command server anyway so we can diagnose
+    echo "WARNING: agentfs mount process exited"
     break
   fi
   i=$((i + 1))
@@ -52,8 +50,8 @@ while [ "$i" -lt 30 ]; do
 done
 
 # -- 3. Start command server --
-echo "Starting command server..."
-node /app/dist/command-server.js &
+echo "Starting command server with cwd=$MOUNT_POINT..."
+DOFS_CWD="$MOUNT_POINT" node /app/dist/command-server.js &
 CMD_PID=$!
 
 echo "All services started (bridge=$BRIDGE_PID, fuse=$FUSE_PID, cmd=$CMD_PID)"
