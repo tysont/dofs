@@ -263,6 +263,145 @@ describe('HranaServer pipeline', () => {
   it('serve exits cleanly on stream close', async () => {
     const client = new TestClient(sql);
     await client.send({ baton: null, requests: [{ type: 'execute', stmt: { sql: 'SELECT 1' } }] });
-    await client.close(); // Should not throw
+    await client.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Statement filtering
+  // ---------------------------------------------------------------------------
+
+  it('skips PRAGMA statements (returns empty result)', async () => {
+    const client = new TestClient(sql);
+    const resp = await client.send({
+      baton: null,
+      requests: [{ type: 'execute', stmt: { sql: 'PRAGMA synchronous = OFF' } }],
+    });
+    expect(resp.results[0].type).toBe('ok');
+    if (resp.results[0].type === 'ok' && resp.results[0].response.type === 'execute') {
+      expect(resp.results[0].response.result.rows).toEqual([]);
+      expect(resp.results[0].response.result.cols).toEqual([]);
+    }
+    await client.close();
+  });
+
+  it('skips BEGIN/COMMIT/ROLLBACK (returns empty result)', async () => {
+    const client = new TestClient(sql);
+    for (const stmt of ['BEGIN', 'COMMIT', 'ROLLBACK', 'BEGIN DEFERRED', 'SAVEPOINT test', 'RELEASE test']) {
+      const resp = await client.send({
+        baton: null,
+        requests: [{ type: 'execute', stmt: { sql: stmt } }],
+      });
+      expect(resp.results[0].type).toBe('ok');
+    }
+    await client.close();
+  });
+
+  it('simulates PRAGMA table_info', async () => {
+    const client = new TestClient(sql);
+    await client.send({
+      baton: null,
+      requests: [{ type: 'execute', stmt: { sql: 'CREATE TABLE info_test (id INTEGER, name TEXT, data BLOB)' } }],
+    });
+
+    const resp = await client.send({
+      baton: null,
+      requests: [{ type: 'execute', stmt: { sql: 'PRAGMA table_info(info_test)' } }],
+    });
+
+    expect(resp.results[0].type).toBe('ok');
+    if (resp.results[0].type === 'ok' && resp.results[0].response.type === 'execute') {
+      const result = resp.results[0].response.result;
+      expect(result.cols.map(c => c.name)).toEqual(['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk']);
+      expect(result.rows.length).toBe(3);
+      // Check column names (index 1 in each row)
+      const colNames = result.rows.map(r => r.values[1]);
+      expect(colNames).toEqual([
+        { type: 'text', value: 'id' },
+        { type: 'text', value: 'name' },
+        { type: 'text', value: 'data' },
+      ]);
+    }
+    await client.close();
+  });
+
+  it('handles sequence with mixed PRAGMAs and SQL', async () => {
+    const client = new TestClient(sql);
+    await client.send({
+      baton: null,
+      requests: [{ type: 'execute', stmt: { sql: 'CREATE TABLE seq_test (x INTEGER)' } }],
+    });
+
+    // Sequence with PRAGMAs and real SQL mixed together
+    const resp = await client.send({
+      baton: null,
+      requests: [{
+        type: 'sequence',
+        sql: 'PRAGMA synchronous = OFF; INSERT INTO seq_test VALUES (1); BEGIN; INSERT INTO seq_test VALUES (2); COMMIT',
+      }],
+    });
+    expect(resp.results[0].type).toBe('ok');
+
+    // Verify only the INSERT statements ran
+    const countResp = await client.send({
+      baton: null,
+      requests: [{ type: 'execute', stmt: { sql: 'SELECT count(*) as c FROM seq_test' } }],
+    });
+    if (countResp.results[0].type === 'ok' && countResp.results[0].response.type === 'execute') {
+      expect(countResp.results[0].response.result.rows[0].values[0]).toEqual({ type: 'integer', value: '2' });
+    }
+    await client.close();
+  });
+
+  it('handles get_autocommit', async () => {
+    const client = new TestClient(sql);
+    const resp = await client.send({
+      baton: null,
+      requests: [{ type: 'get_autocommit' }],
+    });
+    expect(resp.results[0].type).toBe('ok');
+    if (resp.results[0].type === 'ok') {
+      expect(resp.results[0].response).toEqual({ type: 'get_autocommit', is_autocommit: true });
+    }
+    await client.close();
+  });
+
+  it('handles describe', async () => {
+    const client = new TestClient(sql);
+    const resp = await client.send({
+      baton: null,
+      requests: [{ type: 'describe', sql: 'SELECT 1' }],
+    });
+    expect(resp.results[0].type).toBe('ok');
+    if (resp.results[0].type === 'ok') {
+      expect(resp.results[0].response.type).toBe('describe');
+    }
+    await client.close();
+  });
+
+  it('handles store_sql and close_sql', async () => {
+    const client = new TestClient(sql);
+    const resp = await client.send({
+      baton: null,
+      requests: [
+        { type: 'store_sql', sql: 'SELECT 1', sql_id: 1 },
+        { type: 'close_sql', sql_id: 1 },
+      ],
+    });
+    expect(resp.results[0].type).toBe('ok');
+    expect(resp.results[1].type).toBe('ok');
+    await client.close();
+  });
+
+  it('returns error for unsupported stream request type', async () => {
+    const client = new TestClient(sql);
+    const resp = await client.send({
+      baton: null,
+      requests: [{ type: 'unknown_type' } as never],
+    });
+    expect(resp.results[0].type).toBe('error');
+    if (resp.results[0].type === 'error') {
+      expect(resp.results[0].error.message).toContain('Unsupported');
+    }
+    await client.close();
   });
 });
