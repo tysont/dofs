@@ -4,7 +4,7 @@
 import { Container, getContainer } from '@cloudflare/containers';
 import { AgentFS, type CloudflareStorage } from 'agentfs-sdk/cloudflare';
 import { initSchema, SCHEMA_TABLES } from './schema';
-import { HranaServer, wrapSqlStorage } from './hrana-server';
+import { HranaServer, wrapSqlStorage, hranaDebugLog } from './hrana-server';
 
 interface Env {
   DOFS: DurableObjectNamespace<DOFS>;
@@ -246,6 +246,19 @@ export class DOFS extends Container<Env> {
       }
 
       // -- Volume info --
+
+      if (url.pathname === '/hrana-logs') {
+        return new Response(hranaDebugLog.join('\n') || '(empty)');
+      }
+
+      if (url.pathname === '/mount-logs') {
+        try {
+          const resp = await this.containerFetch('http://localhost/mount-logs', 4000);
+          return new Response(await resp.text());
+        } catch {
+          return new Response('Container not running', { status: 503 });
+        }
+      }
 
       if (url.pathname === '/db-info') {
         return Response.json(this.dbInfo());
