@@ -2,7 +2,9 @@
 
 Durable Object FileSystem — a POSIX filesystem backed by Cloudflare Durable Object SQLite, mountable via FUSE in Containers.
 
-Each **volume** is a named, persistent filesystem unit. One Durable Object = one volume. Files written from the DO are visible inside the Container via FUSE, and files written inside the Container are immediately visible from the DO. Data persists across Container destruction — the DO's SQLite database is the sole source of truth.
+Cloudflare Durable Objects have SQLite storage but no filesystem. DOFS gives each DO a real POSIX filesystem by storing file data in the DO's SQLite (using the [AgentFS](https://github.com/tursodatabase/agentfs) schema) and mounting it via FUSE in an attached Container. The result is a persistent, named volume where standard tools — git, python, compilers, shell scripts — work against files that live in DO SQLite.
+
+Each **volume** is one Durable Object. Files can be read and written directly from the DO (via the AgentFS TypeScript SDK, no Container needed) or from inside the Container (via the FUSE mount at `/volume`). Both paths hit the same SQLite tables, so changes are immediately visible from either side. Data persists across Container destruction — the DO's SQLite is the sole source of truth.
 
 ## Quick start
 
