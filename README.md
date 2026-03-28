@@ -71,9 +71,23 @@ curl "$BASE/fs/ls?volume=myproject&path=/"
 
 ### Performance
 
-DOFS is well-suited for agent workloads that are read-heavy with moderate writes — running scripts, reading configs, writing output files. Every FUSE operation is a network round-trip (kernel → agentfs → HTTP → bridge → TCP → DO → SQLite → back), so metadata-heavy operations like `git init` that create hundreds of small files are slow (~60s).
+Typical agent workloads perform well:
 
-For best performance, write files via `/fs/write` (direct DO access, no FUSE overhead) and use `/exec` for computation against those files.
+| Operation | Latency |
+|-----------|---------|
+| `/fs/write` + `/fs/read` (DO SDK, no Container) | <100ms |
+| `/exec` warm container (run a script, read output) | 2-10s |
+| `/exec` cold start (first call to a new volume) | ~30s |
+| `git init --template= && git add . && git commit` | 30-50s |
+
+The bottleneck for FUSE operations is the DO-to-Container network round-trip (~29ms). Every FUSE syscall (open, read, write, stat, readdir) crosses this path. Simple operations like running a Python script involve a handful of FUSE calls and complete quickly. Metadata-heavy operations like `git init` (which creates hundreds of small files) issue 700+ sequential round-trips.
+
+For best results with the current architecture:
+- **Write files via `/fs/write`** — this hits DO SQLite directly with no FUSE overhead
+- **Use `/exec` for computation** — run scripts, compilers, tools against files already on the volume
+- **Avoid metadata-heavy tools in FUSE** — prefer writing project scaffolding via the DO SDK, then using exec for builds/runs
+
+Cloudflare is working on co-locating Durable Objects with their attached Containers on the same machine. When this ships, the per-operation round-trip drops from ~29ms to <1ms, making metadata-heavy operations ~30x faster without any code changes.
 
 ### Data persists across Container destruction
 
