@@ -4,7 +4,7 @@
 import { Container, getContainer } from '@cloudflare/containers';
 import { AgentFS, type CloudflareStorage } from 'agentfs-sdk/cloudflare';
 import { initSchema, SCHEMA_TABLES } from './schema';
-import { HranaServer, wrapSqlStorage, hranaDebugLog } from './hrana-server';
+import { HranaServer, wrapSqlStorage } from './hrana-server';
 
 interface Env {
   DOFS: DurableObjectNamespace<DOFS>;
@@ -15,52 +15,27 @@ export class DOFS extends Container<Env> {
   sleepAfter = '30m';
 
   private fs!: AgentFS;
-
-  // Track the active Hrana serve promise so we don't open multiple TCP connections
   private activeServePromise: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx as never, env);
     this.ctx.blockConcurrencyWhile(async () => {
       initSchema(this.ctx.storage.sql);
-      // AgentFS.create() must run after initSchema so it finds existing tables
-      // rather than creating its own partial set
       this.fs = AgentFS.create(this.ctx.storage as unknown as CloudflareStorage);
     });
   }
 
-  override onStart() {
-    console.log('Container started');
-  }
-
   override onStop() {
-    console.log('Container stopped');
     this.activeServePromise = null;
-  }
-
-  override onError(error: unknown) {
-    console.error('Container error:', error);
   }
 
   // ---------------------------------------------------------------------------
   // Core API
   // ---------------------------------------------------------------------------
 
-  /**
-   * Execute a shell command in the Container against the FUSE-mounted volume.
-   * The FUSE mount is backed by DO SQLite via the Hrana TCP pipe.
-   */
+  /** Execute a shell command in the Container against the FUSE-mounted volume. */
   async exec(command: string): Promise<unknown> {
-    try {
-      await this.ensureContainer();
-    } catch (err) {
-      // Return error details instead of a generic 500
-      return {
-        error: 'ensureContainer failed',
-        message: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-      };
-    }
+    await this.ensureContainer();
 
     const resp = await this.containerFetch(
       new Request('http://localhost/exec', {
@@ -132,7 +107,7 @@ export class DOFS extends Container<Env> {
     // 1. Wait for command server
     await this.startAndWaitForPorts({ ports: [4000] });
 
-    // 2. Start bridge in-process via HTTP
+    // 2. Start bridge in-process
     const setupResp = await this.containerFetch(
       new Request('http://localhost/setup', { method: 'POST' }),
       4000
@@ -142,7 +117,7 @@ export class DOFS extends Container<Env> {
       throw new Error(`Bridge setup failed: ${setupResult.error}`);
     }
 
-    // 3. Connect TCP to bridge :9000, start Hrana server in background
+    // 3. Connect TCP to bridge, start Hrana server in background
     const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
     await socket.opened;
 
@@ -158,25 +133,20 @@ export class DOFS extends Container<Env> {
     );
 
     // 4. Mount FUSE — fire-and-forget, then poll for readiness.
-    // We can't await the mount response because it blocks for up to 30s
-    // while the FUSE daemon sends Hrana requests that the serve() loop must
-    // handle concurrently. Fire the mount request and poll health instead.
+    // Can't await because the mount blocks while FUSE queries flow through serve().
     this.containerFetch(
       new Request('http://localhost/mount', { method: 'POST' }),
       4000
     ).catch(() => {});
 
-    // Poll health until mount is ready
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 1000));
       try {
         const healthResp = await this.containerFetch('http://localhost/health', 4000);
-        const health = (await healthResp.json()) as { fuseMounted?: boolean; cwd?: string };
-        if (health.fuseMounted || health.cwd === '/volume') {
-          break;
-        }
+        const health = (await healthResp.json()) as { fuseMounted?: boolean };
+        if (health.fuseMounted) break;
       } catch {
-        // Not ready yet
+        // Container not ready yet
       }
     }
   }
@@ -189,8 +159,6 @@ export class DOFS extends Container<Env> {
     const url = new URL(request.url);
 
     try {
-      // -- Container commands --
-
       if (url.pathname === '/exec' && request.method === 'POST') {
         const body = (await request.json()) as { command: string };
         return Response.json(await this.exec(body.command));
@@ -200,8 +168,6 @@ export class DOFS extends Container<Env> {
         await this.destroyContainer();
         return new Response('ok');
       }
-
-      // -- Filesystem (direct DO access, no Container) --
 
       if (url.pathname === '/fs/write' && request.method === 'POST') {
         const path = url.searchParams.get('path');
@@ -220,8 +186,6 @@ export class DOFS extends Container<Env> {
         const path = url.searchParams.get('path') ?? '/';
         return Response.json(await this.listDir(path));
       }
-
-      // -- KV store --
 
       if (url.pathname === '/kv/set' && request.method === 'POST') {
         const key = url.searchParams.get('key');
@@ -243,21 +207,6 @@ export class DOFS extends Container<Env> {
           .toArray();
         if (rows.length === 0) return new Response('Not found', { status: 404 });
         return new Response(rows[0].value);
-      }
-
-      // -- Volume info --
-
-      if (url.pathname === '/hrana-logs') {
-        return new Response(hranaDebugLog.join('\n') || '(empty)');
-      }
-
-      if (url.pathname === '/mount-logs') {
-        try {
-          const resp = await this.containerFetch('http://localhost/mount-logs', 4000);
-          return new Response(await resp.text());
-        } catch {
-          return new Response('Container not running', { status: 503 });
-        }
       }
 
       if (url.pathname === '/db-info') {

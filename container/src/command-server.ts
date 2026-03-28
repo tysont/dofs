@@ -12,8 +12,6 @@ let cwd = '/tmp';
 let bridgeStarted = false;
 let fuseProcess: ChildProcess | null = null;
 let fuseExitCode: number | null = null;
-let fuseLogs = '';
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -40,13 +38,6 @@ const server = createServer(async (req, res) => {
       fuseExitCode,
       cwd,
     }));
-    return;
-  }
-
-  // -- Mount logs --
-  if (req.method === 'GET' && req.url === '/mount-logs') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(fuseLogs || '(no output yet)');
     return;
   }
 
@@ -96,9 +87,8 @@ const server = createServer(async (req, res) => {
     );
     fuseProcess = child;
 
-    fuseLogs = '';
-    child.stdout?.on('data', (d: string) => { fuseLogs += d; });
-    child.stderr?.on('data', (d: string) => { fuseLogs += d; });
+    child.stdout?.on('data', (d: string) => process.stdout.write(`[fuse] ${d}`));
+    child.stderr?.on('data', (d: string) => process.stderr.write(`[fuse] ${d}`));
     child.on('exit', (code) => {
       console.log(`[fuse] exited with code ${code}`);
       fuseExitCode = code ?? 1;
