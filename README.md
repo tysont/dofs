@@ -86,9 +86,6 @@ For best results with the current architecture:
 - **Write files via `/fs/write`** — this hits DO SQLite directly with no FUSE overhead
 - **Use `/exec` for computation** — run scripts, compilers, tools against files already on the volume
 - **Avoid metadata-heavy tools in FUSE** — prefer writing project scaffolding via the DO SDK, then using exec for builds/runs
-
-Cloudflare is working on co-locating Durable Objects with their attached Containers on the same machine. When this ships, the per-operation round-trip drops from ~29ms to <1ms, making metadata-heavy operations ~30x faster without any code changes.
-
 ### Data persists across Container destruction
 
 ```bash
