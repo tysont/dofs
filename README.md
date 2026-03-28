@@ -4,6 +4,112 @@ Durable Object FileSystem — a POSIX filesystem backed by Cloudflare Durable Ob
 
 Each **volume** is a named, persistent filesystem unit. One Durable Object = one volume. Files written from the DO are visible inside the Container via FUSE, and files written inside the Container are immediately visible from the DO. Data persists across Container destruction — the DO's SQLite database is the sole source of truth.
 
+## Quick start
+
+Volumes are created on first use. Every request includes `?volume=<name>` to identify which volume to operate on.
+
+### Write and read files
+
+```bash
+BASE=https://your-worker.workers.dev
+
+# Write a file
+curl -X POST "$BASE/fs/write?volume=myproject&path=/config.json" \
+  -d '{"debug": false, "workers": 4}'
+# ok
+
+# Read it back
+curl "$BASE/fs/read?volume=myproject&path=/config.json"
+# {"debug": false, "workers": 4}
+
+# List the root directory
+curl "$BASE/fs/ls?volume=myproject&path=/"
+# ["config.json"]
+```
+
+These operations run directly in the Durable Object — no Container is started and latency is minimal.
+
+### Run commands
+
+```bash
+# Execute a command inside a Linux container with the volume mounted at /volume
+curl -X POST "$BASE/exec?volume=myproject" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "cat /volume/config.json"}'
+# {"exitCode":0,"stdout":"{\"debug\": false, \"workers\": 4}","stderr":""}
+```
+
+The first exec cold-starts a Container and mounts the volume via FUSE (~30s). Subsequent calls reuse the warm Container (~2s). Files written via `/fs/write` are visible at `/volume/` inside the Container, and files written inside the Container are readable via `/fs/read`.
+
+### Use real tools
+
+The Container has git, python3, and standard Linux utilities:
+
+```bash
+# Initialize a git repo on the volume
+curl -X POST "$BASE/exec?volume=myproject" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "cd /volume && git init && echo \"print(42)\" > main.py && git add -A && git -c user.name=dofs -c user.email=dofs@test commit -m \"initial\""}'
+# {"exitCode":0,"stdout":"Initialized empty Git repository in /volume/.git/\n[main (root-commit) a1b2c3d] initial\n...","stderr":""}
+
+# Run Python
+curl -X POST "$BASE/exec?volume=myproject" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "python3 /volume/main.py"}'
+# {"exitCode":0,"stdout":"42\n","stderr":""}
+
+# Verify from the DO side
+curl "$BASE/fs/ls?volume=myproject&path=/"
+# [".git","config.json","main.py"]
+```
+
+### Data persists across Container destruction
+
+```bash
+# Kill the Container
+curl -X POST "$BASE/destroy?volume=myproject"
+# ok
+
+# Data is still there (read directly from DO SQLite, no Container needed)
+curl "$BASE/fs/read?volume=myproject&path=/main.py"
+# print(42)
+
+# Start a new Container — previous data is visible via FUSE
+curl -X POST "$BASE/exec?volume=myproject" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "cat /volume/main.py && git -C /volume log --oneline"}'
+# {"exitCode":0,"stdout":"print(42)\na1b2c3d initial\n","stderr":""}
+```
+
+### KV store
+
+Each volume also has a simple key-value store:
+
+```bash
+curl -X POST "$BASE/kv/set?volume=myproject&key=status" -d "running"
+# ok
+
+curl "$BASE/kv/get?volume=myproject&key=status"
+# running
+```
+
+### Volume isolation
+
+Volumes are completely isolated. Each gets its own DO instance with its own SQLite database:
+
+```bash
+curl -X POST "$BASE/fs/write?volume=project-a&path=/a.txt" -d "I am A"
+curl -X POST "$BASE/fs/write?volume=project-b&path=/b.txt" -d "I am B"
+
+curl "$BASE/fs/ls?volume=project-a&path=/"
+# ["a.txt"]
+
+curl "$BASE/fs/ls?volume=project-b&path=/"
+# ["b.txt"]
+```
+
+---
+
 ## How it works
 
 ### AgentFS
