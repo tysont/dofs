@@ -16,6 +16,7 @@ export class DOFS extends Container<Env> {
 
   private fs!: AgentFS;
   private activeServePromise: Promise<void> | null = null;
+  private hranaServer: HranaServer | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx as never, env);
@@ -126,13 +127,13 @@ export class DOFS extends Container<Env> {
     const socket = this.ctx.container!.getTcpPort(9000).connect('0.0.0.0:9000');
     await socket.opened;
 
-    const server = new HranaServer({
+    this.hranaServer = new HranaServer({
       readable: socket.readable,
       writable: socket.writable,
       sql: wrapSqlStorage(this.ctx.storage.sql),
     });
 
-    this.activeServePromise = server.serve().then(
+    this.activeServePromise = this.hranaServer.serve().then(
       () => { this.activeServePromise = null; },
       () => { this.activeServePromise = null; }
     );
@@ -233,6 +234,13 @@ export class DOFS extends Container<Env> {
           .toArray();
         if (rows.length === 0) return new Response('Not found', { status: 404 });
         return new Response(rows[0].value);
+      }
+
+      if (url.pathname === '/perf') {
+        return Response.json({
+          pipelineRequests: this.hranaServer?.pipelineCount ?? 0,
+          sqlStatements: this.hranaServer?.statementCount ?? 0,
+        });
       }
 
       if (url.pathname === '/db-info') {

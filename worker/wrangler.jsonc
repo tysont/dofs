@@ -7,7 +7,7 @@
     {
       "class_name": "DOFS",
       "image": "../container/Dockerfile",
-      "max_instances": 10
+      "max_instances": 50
     }
   ],
   "durable_objects": {

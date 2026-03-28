@@ -10,70 +10,77 @@ const HEADER_SIZE = 4;
 
 let doSocket: Socket | null = null;
 let tcpBuffer = Buffer.alloc(0);
-let pendingResolve: ((data: Buffer) => void) | null = null;
+
+// Queue of pending response handlers. Responses arrive in order (DO processes
+// requests sequentially) so we resolve them FIFO.
+const pendingQueue: Array<{
+  resolve: (data: Buffer) => void;
+  reject: (err: Error) => void;
+}> = [];
 
 function handleTcpData(data: Buffer): void {
   tcpBuffer = Buffer.concat([tcpBuffer, data]);
-  tryDeliverFrame();
+  drainFrames();
 }
 
-function tryDeliverFrame(): void {
-  if (!pendingResolve) return;
-  if (tcpBuffer.length < HEADER_SIZE) return;
-  const jsonLen = tcpBuffer.readUInt32BE(0);
-  if (tcpBuffer.length < HEADER_SIZE + jsonLen) return;
-  const frame = tcpBuffer.subarray(HEADER_SIZE, HEADER_SIZE + jsonLen);
-  tcpBuffer = tcpBuffer.subarray(HEADER_SIZE + jsonLen);
-  const resolve = pendingResolve;
-  pendingResolve = null;
-  resolve(frame);
+function drainFrames(): void {
+  while (pendingQueue.length > 0) {
+    if (tcpBuffer.length < HEADER_SIZE) return;
+    const jsonLen = tcpBuffer.readUInt32BE(0);
+    if (tcpBuffer.length < HEADER_SIZE + jsonLen) return;
+
+    const frame = tcpBuffer.subarray(HEADER_SIZE, HEADER_SIZE + jsonLen);
+    tcpBuffer = tcpBuffer.subarray(HEADER_SIZE + jsonLen);
+
+    const pending = pendingQueue.shift()!;
+    pending.resolve(Buffer.from(frame));
+  }
 }
 
+/** Send a length-prefixed JSON frame and wait for the next response frame. */
 function sendAndReceive(payload: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     if (!doSocket || doSocket.destroyed) {
       reject(new Error('No DO TCP connection'));
       return;
     }
-    pendingResolve = resolve;
+
+    pendingQueue.push({ resolve, reject });
+
     const header = Buffer.alloc(HEADER_SIZE);
     header.writeUInt32BE(payload.length, 0);
     doSocket.write(Buffer.concat([header, payload]), (err) => {
-      if (err) { pendingResolve = null; reject(err); }
+      if (err) {
+        // Remove from queue and reject
+        const idx = pendingQueue.findIndex(p => p.resolve === resolve);
+        if (idx >= 0) pendingQueue.splice(idx, 1);
+        reject(err);
+      }
     });
-    tryDeliverFrame();
+
+    // Check if we already have a buffered response
+    drainFrames();
   });
 }
 
-/**
- * Convert a cursor request to a pipeline request, execute via TCP,
- * then convert the pipeline response to cursor NDJSON streaming format.
- */
+/** Translate a cursor request to a pipeline batch, stream NDJSON response. */
 async function handleCursor(body: string, res: import('http').ServerResponse): Promise<void> {
-  // Parse cursor request: { baton, batch: { steps: [...] } }
   const cursorReq = JSON.parse(body);
-  const batch = cursorReq.batch;
-  const baton = cursorReq.baton || null;
-
-  // Convert to pipeline request with a single batch
   const pipelineReq = {
-    baton,
-    requests: [{ type: 'batch', batch }],
+    baton: cursorReq.baton || null,
+    requests: [{ type: 'batch', batch: cursorReq.batch }],
   };
 
   const responseFrame = await sendAndReceive(Buffer.from(JSON.stringify(pipelineReq), 'utf-8'));
   const pipelineResp = JSON.parse(responseFrame.toString('utf-8'));
 
-  // Stream NDJSON cursor response
-  res.writeHead(200, {
-    'Content-Type': 'text/plain',
-    'Transfer-Encoding': 'chunked',
-  });
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
 
-  // First line: cursor metadata
-  res.write(JSON.stringify({ baton: pipelineResp.baton, base_url: pipelineResp.base_url }) + '\n');
+  res.write(JSON.stringify({
+    baton: pipelineResp.baton,
+    base_url: pipelineResp.base_url,
+  }) + '\n');
 
-  // Convert batch result to cursor entries
   const batchResult = pipelineResp.results?.[0];
   if (batchResult?.type === 'ok' && batchResult.response?.type === 'batch') {
     const result = batchResult.response.result;
@@ -81,36 +88,26 @@ async function handleCursor(body: string, res: import('http').ServerResponse): P
     const stepErrors = result.step_errors || [];
 
     for (let i = 0; i < stepResults.length; i++) {
-      const stepResult = stepResults[i];
-      const stepError = stepErrors[i];
-
-      if (stepError) {
+      if (stepErrors[i]) {
         res.write(JSON.stringify({
-          type: 'step_error',
-          step: i,
-          error: { message: stepError.message, code: stepError.code || 'UNKNOWN' },
+          type: 'step_error', step: i,
+          error: { message: stepErrors[i].message, code: stepErrors[i].code || 'UNKNOWN' },
         }) + '\n');
         continue;
       }
-
+      const stepResult = stepResults[i];
       if (!stepResult) continue;
 
-      // step_begin
       res.write(JSON.stringify({
-        type: 'step_begin',
-        step: i,
-        cols: stepResult.cols || [],
+        type: 'step_begin', step: i, cols: stepResult.cols || [],
       }) + '\n');
 
-      // rows
       for (const row of stepResult.rows || []) {
         res.write(JSON.stringify({
-          type: 'row',
-          row: row.values || row,
+          type: 'row', row: row.values || row,
         }) + '\n');
       }
 
-      // step_end
       res.write(JSON.stringify({
         type: 'step_end',
         affected_row_count: stepResult.affected_row_count || 0,
@@ -119,8 +116,7 @@ async function handleCursor(body: string, res: import('http').ServerResponse): P
     }
   } else if (batchResult?.type === 'error') {
     res.write(JSON.stringify({
-      type: 'error',
-      error: batchResult.error?.message || 'unknown error',
+      type: 'error', error: batchResult.error?.message || 'unknown error',
     }) + '\n');
   }
 
@@ -134,27 +130,24 @@ export function startBridge(): Promise<void> {
     function checkReady(): void { if (tcpReady && httpReady) resolve(); }
 
     const tcpServer = createTcpServer((socket) => {
-      console.log('DO connected via TCP');
-      if (doSocket && !doSocket.destroyed) {
-        console.warn('Replacing existing DO TCP connection');
-        doSocket.destroy();
-      }
+      if (doSocket && !doSocket.destroyed) doSocket.destroy();
       doSocket = socket;
       tcpBuffer = Buffer.alloc(0);
-      pendingResolve = null;
+      // Reject all pending requests from the old connection
+      while (pendingQueue.length) {
+        pendingQueue.shift()!.reject(new Error('TCP connection replaced'));
+      }
       socket.on('data', handleTcpData);
-      socket.on('end', () => { console.log('DO TCP closed'); doSocket = null; });
-      socket.on('error', (err) => { console.error('DO TCP error:', err.message); doSocket = null; });
+      socket.on('end', () => { doSocket = null; });
+      socket.on('error', () => { doSocket = null; });
     });
 
     tcpServer.listen(TCP_PORT, '0.0.0.0', () => {
-      console.log(`Bridge TCP listening on :${TCP_PORT}`);
       tcpReady = true;
       checkReady();
     });
 
     const httpServer = createHttpServer(async (req, res) => {
-      // Health check
       if (req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('ok');
@@ -168,9 +161,8 @@ export function startBridge(): Promise<void> {
       }
 
       let body = '';
-      for await (const chunk of req) { body += chunk; }
+      for await (const chunk of req) body += chunk;
 
-      // Pipeline endpoint — forward directly over TCP
       if (req.method === 'POST' && req.url?.startsWith('/v3/pipeline')) {
         try {
           const responseFrame = await sendAndReceive(Buffer.from(body, 'utf-8'));
@@ -183,14 +175,11 @@ export function startBridge(): Promise<void> {
         return;
       }
 
-      // Cursor endpoint — translate to pipeline, stream NDJSON response
       if (req.method === 'POST' && req.url?.startsWith('/v3/cursor')) {
         try {
           await handleCursor(body, res);
         } catch (err) {
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-          }
+          if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
         }
         return;
@@ -201,7 +190,6 @@ export function startBridge(): Promise<void> {
     });
 
     httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
-      console.log(`Bridge HTTP listening on :${HTTP_PORT}`);
       httpReady = true;
       checkReady();
     });

@@ -230,6 +230,11 @@ export class HranaServer {
   private writable: WritableStream<Uint8Array>;
   private baton: string | null = null;
 
+  /** Count of pipeline requests processed (for performance measurement). */
+  pipelineCount = 0;
+  /** Count of individual SQL statements executed (for performance measurement). */
+  statementCount = 0;
+
   constructor(opts: {
     readable: ReadableStream<Uint8Array>;
     writable: WritableStream<Uint8Array>;
@@ -263,6 +268,7 @@ export class HranaServer {
   }
 
   private handlePipeline(req: PipelineRequest): PipelineResponse {
+    this.pipelineCount++;
     const results: StreamResult[] = req.requests.map((streamReq) => {
       try {
         return { type: 'ok' as const, response: this.handleStreamRequest(streamReq) };
@@ -287,6 +293,7 @@ export class HranaServer {
         return { type: 'close' };
 
       case 'execute':
+        this.statementCount++;
         return { type: 'execute', result: executeStmt(this.sql, req.stmt) };
 
       case 'batch':
