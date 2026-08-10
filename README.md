@@ -1,7 +1,5 @@
 # AiryFS
 
-**A cloud filesystem where storage is the platform and compute is a guest.**
-
 AiryFS gives every application, agent, user, or task its own isolated POSIX-style filesystem built on [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/). Each volume lives entirely inside one Durable Object's SQLite database — that database is the *only* durable copy of the data. Ordinary file operations run directly in the Durable Object with no other compute involved. When a workload needs Git, Python, a compiler, or any other native Linux tool, AiryFS attaches an on-demand [Container](https://developers.cloudflare.com/containers/) and exposes the same SQLite rows at `/volume` through FUSE.
 
 The Container is a disposable client of the volume, never its owner. There is no second durable copy to synchronize, no object store behind the mount, and no clone-back step when compute goes away. Losing the Container means a remount, not data recovery.
